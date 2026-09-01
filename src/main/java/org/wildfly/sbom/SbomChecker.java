@@ -128,9 +128,9 @@ public class SbomChecker {
                 .collect(Collectors.toSet());
         Map<String, String> parentIndex = buildParentIndex(bom.getComponents());
 
-        CheckResult sbomVsDisk                  = checkSbomVsDisk(mavenComponents, installedJars, installRoot);
-        CheckResult diskVsSbom                  = checkDiskVsSbom(installedJars, mavenComponents);
-        Map<String, List<String>> shadedInfo    = collectShadedArtifacts(mavenComponents, diskFileNames, parentIndex, manifest);
+        CheckResult sbomVsDisk                      = checkSbomVsDisk(mavenComponents, installedJars, installRoot);
+        CheckResult diskVsSbom                      = checkDiskVsSbom(installedJars, mavenComponents);
+        ShadedResult shadedResult                   = collectShadedArtifacts(mavenComponents, diskFileNames, parentIndex, manifest);
 
         printResult("CHECK 1 — SBOM components present on disk", sbomVsDisk);
         printResult("CHECK 2 — Disk JARs declared in SBOM", diskVsSbom);
@@ -138,14 +138,16 @@ public class SbomChecker {
             CheckResult sbomVsManifest = checkSbomVsManifest(mavenComponents, manifest);
             printResult("CHECK 3 — SBOM versions match manifest.yaml", sbomVsManifest);
             if (verbose) {
-                printNotInManifest("INFO — SBOM components not present in manifest.yaml", mavenComponents, manifest);
+                printNotInManifest("INFO — SBOM components not present in manifest.yaml",
+                        mavenComponents, manifest, shadedResult.totalArtifacts());
             }
         } else {
             printSkipped("CHECK 3 — SBOM versions match manifest.yaml",
                     "no .installation/manifest.yaml found in this installation");
         }
         if (verbose) {
-            printShadedInfo("INFO — Parent JARs containing shaded dependencies not tracked by manifest", shadedInfo);
+            printShadedInfo("INFO — Parent JARs containing shaded dependencies not tracked by manifest",
+                    shadedResult.grouped());
         }
 
         boolean allOk = sbomVsDisk.passed() && diskVsSbom.passed();
@@ -484,11 +486,14 @@ public class SbomChecker {
      * exist on disk are excluded: they are real installed JARs that happen to
      * also appear as a POM dependency of another component.</p>
      */
+    /** Result of {@link #collectShadedArtifacts}: grouped map plus total artifact count. */
+    record ShadedResult(Map<String, List<String>> grouped, int totalArtifacts) {}
+
     /**
-     * Groups shaded/POM-derived artifacts by their parent purl.
+     * Groups shaded/POM-derived artifacts (not fully tracked by the manifest) by their parent purl.
      * Key: parent purl (or "(no parent)" for orphans); value: sorted list of child purls.
      */
-    private static Map<String, List<String>> collectShadedArtifacts(
+    private static ShadedResult collectShadedArtifacts(
             List<Component> allMavenComponents,
             Set<String> diskFileNames,
             Map<String, String> parentIndex,
@@ -503,14 +508,19 @@ public class SbomChecker {
                     if (fatJar == null) return true;
                     return !diskFileNames.contains(Path.of(fatJar).getFileName().toString());
                 })
-                // Only include children not already tracked by the manifest
-                .filter(c -> !manifest.containsKey(c.getGroup() + ":" + c.getName()))
+                // Only exclude children whose exact version is already tracked by the manifest.
+                // If the manifest has a different version, the shaded copy is still noteworthy.
+                .filter(c -> {
+                    String manifestVersion = manifest.get(c.getGroup() + ":" + c.getName());
+                    return manifestVersion == null || !manifestVersion.equals(c.getVersion());
+                })
                 .forEach(c -> {
                     String parent = parentIndex.getOrDefault(c.getPurl(), "(no parent)");
                     grouped.computeIfAbsent(parent, k -> new ArrayList<>()).add(c.getPurl());
                 });
         grouped.values().forEach(Collections::sort);
-        return grouped;
+        int total = grouped.values().stream().mapToInt(List::size).sum();
+        return new ShadedResult(grouped, total);
     }
 
     /**
@@ -592,7 +602,8 @@ public class SbomChecker {
     // -----------------------------------------------------------------------
 
     private static void printNotInManifest(String title,
-            List<Component> mavenComponents, Map<String, String> manifest) {
+            List<Component> mavenComponents, Map<String, String> manifest,
+            int shadedTotal) {
         // Check ALL maven components (including POM-derived) against the manifest.
         // Groups by groupId:artifactId to detect multi-version entries in the SBOM.
 
@@ -605,8 +616,12 @@ public class SbomChecker {
                     .add(c.getVersion() + " (" + kind + ")");
         }
 
+        // notPresent: POM-derived artifact versions with no manifest entry at all
+        // multiVersion: POM-derived artifact versions whose GA is in manifest but at a different version
         List<String> notPresent   = new ArrayList<>();
         List<String> multiVersion = new ArrayList<>();
+        int notPresentArtifacts   = 0; // count of individual shaded artifacts not in manifest
+        int multiVersionArtifacts = 0; // count of individual shaded artifacts with version mismatch
 
         for (Map.Entry<String, List<String>> entry : sbomVersionsByGa.entrySet()) {
             String ga = entry.getKey();
@@ -614,6 +629,9 @@ public class SbomChecker {
             String manifestVersion = manifest.get(ga);
 
             if (manifestVersion == null) {
+                // count shaded versions for this GA
+                long shadedCount = versions.stream().filter(v -> v.endsWith("(shaded)")).count();
+                notPresentArtifacts += (int) shadedCount;
                 // Only report once per ga, pick the installed version if available
                 String repr = versions.stream()
                         .filter(v -> v.endsWith("(installed)"))
@@ -625,9 +643,12 @@ public class SbomChecker {
                 boolean anyMismatch = versions.stream()
                         .anyMatch(v -> !v.startsWith(manifestVersion + " "));
                 if (anyMismatch) {
-                    String allVersions = versions.stream()
-                            .map(v -> v)
-                            .collect(Collectors.joining(", "));
+                    // count shaded versions that differ from manifest
+                    long shadedMismatch = versions.stream()
+                            .filter(v -> v.endsWith("(shaded)") && !v.startsWith(manifestVersion + " "))
+                            .count();
+                    multiVersionArtifacts += (int) shadedMismatch;
+                    String allVersions = String.join(", ", versions);
                     int count = versions.size();
                     multiVersion.add(ga + "  manifest=" + manifestVersion
                             + "  sbom contains " + count + " version(s): " + allVersions);
@@ -637,19 +658,30 @@ public class SbomChecker {
         Collections.sort(notPresent);
         Collections.sort(multiVersion);
 
+        int infoTotal = notPresentArtifacts + multiVersionArtifacts;
+
         System.out.println("┌─ " + title);
         if (notPresent.isEmpty() && multiVersion.isEmpty()) {
             System.out.println("│  (none)");
         } else {
+            // Cross-check: infoTotal should equal shadedTotal (the shaded INFO section count)
+            String crossCheck = infoTotal == shadedTotal
+                    ? "= " + shadedTotal + " shaded artifacts in next INFO section"
+                    : "WARNING: expected " + shadedTotal + " but counted " + infoTotal;
+            System.out.println("│  Total shaded artifacts accounted for: "
+                    + notPresentArtifacts + " not in manifest + "
+                    + multiVersionArtifacts + " version mismatch = "
+                    + infoTotal + "  (" + crossCheck + ")");
+            System.out.println("│");
             if (!multiVersion.isEmpty()) {
-                System.out.println("│  Multiple versions in SBOM (" + multiVersion.size() + "):");
+                System.out.println("│  Multiple versions in SBOM (" + multiVersion.size() + " artifact(s)):");
                 for (String e : multiVersion) {
                     System.out.println("│    ⚠ " + e);
                 }
             }
             if (!notPresent.isEmpty()) {
                 if (!multiVersion.isEmpty()) System.out.println("│");
-                System.out.println("│  Not in manifest (" + notPresent.size() + "):");
+                System.out.println("│  Not in manifest (" + notPresentArtifacts + " artifact(s) across " + notPresent.size() + " group(s)):");
                 for (String e : notPresent) {
                     System.out.println("│    ℹ " + e);
                 }
