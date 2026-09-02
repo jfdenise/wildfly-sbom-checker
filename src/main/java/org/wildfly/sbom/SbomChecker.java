@@ -83,7 +83,9 @@ public class SbomChecker {
         }
 
         // Collect all maven components from the SBOM (flatten the two-level tree)
+        // pkg:npm sub-components (e.g. HAL console JS deps) are counted separately but excluded from all checks.
         List<Component> mavenComponents = collectMavenComponents(bom.getComponents());
+        long npmComponents = countByPurlScheme(bom.getComponents(), "pkg:npm/");
 
         // ---- 2. Scan the installation on disk --------------------------
         InstallationScanner scanner = new InstallationScanner(installRoot);
@@ -119,7 +121,7 @@ public class SbomChecker {
                 + (hasManifest ? manifest.size() : "n/a (no manifest.yaml)"));
 
         System.out.println();
-        printSbomBreakdown(bom.getComponents(), mavenComponents);
+        printSbomBreakdown(bom.getComponents(), mavenComponents, npmComponents);
 
         // ---- Run checks ------------------------------------------------
         // Build shared indexes once
@@ -201,6 +203,17 @@ public class SbomChecker {
             result.addAll(collectMavenComponents(c.getComponents()));
         }
         return result;
+    }
+
+    /** Recursively counts all components whose purl starts with the given scheme. */
+    static long countByPurlScheme(List<Component> components, String scheme) {
+        if (components == null) return 0;
+        long count = 0;
+        for (Component c : components) {
+            if (c.getPurl() != null && c.getPurl().startsWith(scheme)) count++;
+            count += countByPurlScheme(c.getComponents(), scheme);
+        }
+        return count;
     }
 
     /**
@@ -542,7 +555,7 @@ public class SbomChecker {
      *       JAR on disk.</li>
      * </ul>
      */
-    private static void printSbomBreakdown(List<Component> topLevel, List<Component> allMaven) {
+    private static void printSbomBreakdown(List<Component> topLevel, List<Component> allMaven, long npm) {
         // Collect pkg:generic top-level wrappers (not in allMaven, which filters for pkg:maven only)
         List<String> genericTopNames = topLevel == null ? Collections.emptyList() : topLevel.stream()
                 .filter(c -> c.getPurl() != null && c.getPurl().startsWith("pkg:generic/"))
@@ -568,7 +581,7 @@ public class SbomChecker {
             }
         }
 
-        long total = genericTopNames.size() + allMaven.size();
+        long total = genericTopNames.size() + allMaven.size() + npm;
 
         System.out.println("┌─ SBOM entry breakdown");
         System.out.printf("│  Total entries                          : %4d%n", total);
@@ -577,6 +590,9 @@ public class SbomChecker {
         System.out.printf("│    Native .so/.dll                      : %4d  (installed as shared libraries under lib/)%n", nativeLib);
         System.out.printf("│    POM-derived / shaded                 : %4d  (bundled inside a parent JAR)%n", pomDerived);
         System.out.printf("│    Non-JAR type                         : %4d  (type=txt or similar, not a JAR)%n", nonJarType);
+        if (npm > 0) {
+            System.out.printf("│    npm (JS/front-end, not checked)      : %4d  (bundled inside hal-console resources JAR)%n", npm);
+        }
         System.out.printf("│    Installable JARs                     : %4d  (expected on disk)%n", installable);
         System.out.println();
     }
